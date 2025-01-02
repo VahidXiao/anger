@@ -1,11 +1,9 @@
 from fastapi import FastAPI, HTTPException
 from datetime import datetime
 import asyncio
-import logging
-from functools import lru_cache
-
-import torch
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from functools import lru_cache
+import torch
 
 ###############################################################################
 # 1. Concurrency Control
@@ -18,129 +16,84 @@ SEMAPHORE = asyncio.Semaphore(DEFAULT_CONCURRENCY)
 ###############################################################################
 app = FastAPI(
     title="Optimized Anxiety Detection Service",
-    description=(
-        "A FastAPI service mapping 'fear' to 'anxiety' using an optimized emotion "
-        "model, improved thresholds, and enhanced multilingual support."
-    ),
-    version="2.1.0",
+    description="A lightweight service mapping 'fear' to 'anxiety' using an optimized DistilBERT model.",
+    version="3.0.0",
 )
 
 ###############################################################################
-# 3. Logging Configuration
+# 3. Global Variables
 ###############################################################################
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler()]
-)
-logger = logging.getLogger()
-
-###############################################################################
-# 4. Global Variables
-###############################################################################
-emotion_model = None
-emotion_tokenizer = None
-
+MODEL_NAME = "bhadresh-savani/distilbert-base-uncased-emotion"
 LABELS = ["anger", "fear", "joy", "love", "sadness", "surprise"]
-ANXIETY_THRESHOLD = 0.3  # Lowered threshold for more sensitive detection
+ANXIETY_THRESHOLD = 0.5
+
+emotion_model = None
+tokenizer = None
 
 ###############################################################################
-# 5. Resource Loading at Startup
+# 4. Resource Loading at Startup
 ###############################################################################
 @app.on_event("startup")
 async def load_resources():
-    """
-    Load all required resources:
-      - Optimized emotion classification model
-    """
-    global emotion_model, emotion_tokenizer
-
-    logger.info("Loading resources...")
+    global emotion_model, tokenizer
+    print("Loading resources...")
 
     try:
-        # 1) Load the tokenizer
-        emotion_tokenizer = AutoTokenizer.from_pretrained("bhadresh-savani/distilbert-base-uncased-emotion")
+        # Load tokenizer and model
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+        emotion_model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME)
 
-        # 2) Load the emotion classification model
-        emotion_model = AutoModelForSequenceClassification.from_pretrained(
-            "bhadresh-savani/distilbert-base-uncased-emotion"
-        )
-
-        # 3) Optional GPU usage
+        # Optional: Use GPU if available
         if torch.cuda.is_available():
             emotion_model.to("cuda")
-            logger.info("Using GPU for inference.")
+            print("Using GPU for inference.")
         else:
-            logger.info("Using CPU for inference.")
-
-        logger.info("All resources loaded successfully.")
+            print("Using CPU for inference.")
+        print("Resources loaded successfully.")
     except Exception as e:
-        logger.error(f"Failed to load resources: {e}")
         raise RuntimeError(f"Failed to load resources: {str(e)}")
 
 ###############################################################################
-# 6. Cached Emotion Detection
+# 5. Cached Emotion Detection
 ###############################################################################
 @lru_cache(maxsize=100)
-def cached_emotion_detection(english_text: str):
+def cached_emotion_detection(text: str):
     """
-    Perform tokenization and emotion classification on the given English text.
-    Returns a probability distribution for each label:
-      [p_anger, p_fear, p_joy, p_love, p_sadness, p_surprise]
+    Tokenizes the given text, performs emotion classification, and returns
+    the probability distribution for each label.
     """
     try:
-        inputs = emotion_tokenizer(english_text, return_tensors="pt", truncation=True, max_length=512)
+        inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
         if torch.cuda.is_available():
             inputs = {k: v.to("cuda") for k, v in inputs.items()}
 
         with torch.no_grad():
             outputs = emotion_model(**inputs)
-        probs = outputs.logits.softmax(dim=-1).cpu().numpy()[0]
+        probs = outputs.logits.softmax(dim=-1).cpu().numpy()[0]  # shape: (6,)
         return probs
     except Exception as e:
-        logger.error(f"Error during classification inference: {e}")
-        raise RuntimeError(f"Error during classification inference: {str(e)}")
+        raise RuntimeError(f"Error during inference: {str(e)}")
 
 ###############################################################################
-# 7. Main Endpoint: Anxiety Analysis
+# 6. Main Endpoint: Anxiety Detection
 ###############################################################################
 @app.post("/analyze/anxiety")
 async def analyze_anxiety(input_data: dict):
     """
-    Analyzes the input text (in English) for "anxiety."
-    We interpret the 'fear' label as anxiety and check if it exceeds a threshold.
-
-    Example payload:
-    {
-      "text": "I feel so worried and anxious about tomorrow."
-    }
-
-    Returns:
-    {
-      "is_anxious": bool,
-      "anxiety_score": float,
-      "emotion_distribution": [float, ... 6 items],
-      "timestamp": ISO string,
-      "language": "en"
-    }
+    Analyze the input text for anxiety based on the 'fear' label.
     """
     async with SEMAPHORE:
         if "text" not in input_data:
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid input: 'text' is required."
-            )
-        raw_text = input_data["text"].strip()
-        if not raw_text:
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid input: text cannot be empty."
-            )
+            raise HTTPException(status_code=400, detail="Invalid input: 'text' is required.")
 
-        # Run the emotion detection model
-        probs = cached_emotion_detection(raw_text)
+        text = input_data["text"].strip()
+        if not text:
+            raise HTTPException(status_code=400, detail="Invalid input: text cannot be empty.")
 
-        # 'fear' => anxiety_score
+        # Perform inference
+        probs = cached_emotion_detection(text)
+
+        # Map 'fear' to anxiety score
         if "fear" in LABELS:
             fear_idx = LABELS.index("fear")
             anxiety_score = float(probs[fear_idx])
@@ -149,10 +102,10 @@ async def analyze_anxiety(input_data: dict):
 
         is_anxious = (anxiety_score > ANXIETY_THRESHOLD)
 
+        # Construct response
         return {
             "is_anxious": is_anxious,
             "anxiety_score": anxiety_score,
             "emotion_distribution": probs.tolist(),
             "timestamp": datetime.now().isoformat(),
-            "language": "en"
         }
